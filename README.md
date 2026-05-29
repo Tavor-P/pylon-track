@@ -39,40 +39,60 @@ Source files still use the `ferret_tracker` name internally; the repo name refle
 
 ## Requirements
 
-| Dependency | Notes |
-|------------|--------|
-| **Basler pylon SDK** | Default path `/opt/pylon`. [Download](https://www.baslerweb.com/en/software/pylon/) |
-| **OpenCV** | `core`, `imgproc`, `video` (MOG2, contours, Kalman). Install dev headers (see below). |
-| **CMake** | ≥ 3.16 |
-| **C++ compiler** | C++17 |
-| **Hardware** | Basler USB3 camera (configured for **a2A1920-160umPRO**-class sensor at 1.2 m, 4 mm lens) |
+### Required installations
 
-## Build
+All four are required before `cmake` will succeed:
 
-### 1. Install OpenCV (required)
+| Package | Purpose | Ubuntu / Debian | Fedora |
+|---------|---------|-----------------|--------|
+| **build-essential** | C++17 compiler, `make`, linker | `build-essential` | `gcc-c++` `make` |
+| **cmake** | Configure the project (≥ 3.16) | `cmake` | `cmake` |
+| **OpenCV (dev)** | MOG2, contours, Kalman (`core`, `imgproc`, `video`) | `libopencv-dev` | `opencv-devel` |
+| **Basler pylon SDK** | Camera grab + GenICam API | [Install from Basler](https://www.baslerweb.com/en/software/pylon/) → default `/opt/pylon` | same |
 
-CMake needs the **development** package (includes `OpenCVConfig.cmake`), not just runtime libraries.
+### Hardware
 
-**Ubuntu / Debian:**
+- Basler **USB3** camera (settings target **a2A1920-160umPRO**-class sensor at 1.2 m, 4 mm lens)
+- USB3 port with enough bandwidth for ~200 fps mono8
+
+## Install dependencies
+
+### Ubuntu / Debian (recommended)
 
 ```bash
 sudo apt update
-sudo apt install -y libopencv-dev build-essential cmake
+sudo apt install -y build-essential cmake libopencv-dev
 ```
 
-**Fedora:**
+### Fedora
 
 ```bash
-sudo dnf install -y opencv-devel cmake gcc-c++
+sudo dnf install -y gcc-c++ make cmake opencv-devel
 ```
 
-Verify the config file exists:
+### Basler pylon SDK
+
+1. Download and install the **pylon Camera Software Suite** for Linux from [Basler pylon](https://www.baslerweb.com/en/software/pylon/).
+2. Default install path is `/opt/pylon` (used by `CMakeLists.txt`).
+3. Confirm headers exist:
+
+```bash
+ls /opt/pylon/include/pylon/PylonIncludes.h
+```
+
+If installed elsewhere, pass `-DPYLON_ROOT=/your/pylon/path` when running `cmake`.
+
+### Verify OpenCV (dev)
+
+CMake needs `OpenCVConfig.cmake` (from the **dev** package, not runtime-only):
 
 ```bash
 ls /usr/lib/x86_64-linux-gnu/cmake/opencv4/OpenCVConfig.cmake
 ```
 
-### 2. Configure and compile
+## Build
+
+### Configure and compile
 
 ```bash
 cd pylon-track
