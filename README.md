@@ -43,12 +43,12 @@ Source files still use the `ferret_tracker` name internally; the repo name refle
 
 All four are required before `cmake` will succeed:
 
-| Package | Purpose | Ubuntu / Debian | Fedora |
-|---------|---------|-----------------|--------|
-| **build-essential** | C++17 compiler, `make`, linker | `build-essential` | `gcc-c++` `make` |
-| **cmake** | Configure the project (≥ 3.16) | `cmake` | `cmake` |
-| **OpenCV (dev)** | MOG2, contours, Kalman (`core`, `imgproc`, `video`) | `libopencv-dev` | `opencv-devel` |
-| **Basler pylon SDK** | Camera grab + GenICam API | [Install from Basler](https://www.baslerweb.com/en/software/pylon/) → default `/opt/pylon` | same |
+| Package | Purpose | Ubuntu / Debian package |
+|---------|---------|-------------------------|
+| **build-essential** | C++17 compiler, `make`, linker | `build-essential` |
+| **cmake** | Configure the project (≥ 3.16) | `cmake` |
+| **OpenCV (dev)** | MOG2, contours, Kalman (`core`, `imgproc`, `video`) | `libopencv-dev` |
+| **Basler pylon SDK** | Camera grab + GenICam API | [Install from Basler](https://www.baslerweb.com/en/software/pylon/) → default `/opt/pylon` |
 
 ### Hardware
 
@@ -57,17 +57,11 @@ All four are required before `cmake` will succeed:
 
 ## Install dependencies
 
-### Ubuntu / Debian (recommended)
+### Ubuntu / Debian
 
 ```bash
 sudo apt update
 sudo apt install -y build-essential cmake libopencv-dev
-```
-
-### Fedora
-
-```bash
-sudo dnf install -y gcc-c++ make cmake opencv-devel
 ```
 
 ### Basler pylon SDK
@@ -194,7 +188,7 @@ main loop reads TrackState → printf distance + kinematics
 
 | Issue | Things to check |
 |-------|-----------------|
-| `Could not find a package configuration file provided by "OpenCV"` | Install `libopencv-dev` (Ubuntu) or `opencv-devel` (Fedora). Then use `-DOpenCV_DIR=/usr/lib/x86_64-linux-gnu/cmake/opencv4` if needed |
+| `Could not find a package configuration file provided by "OpenCV"` | Install `libopencv-dev`, then use `-DOpenCV_DIR=/usr/lib/x86_64-linux-gnu/cmake/opencv4` if needed |
 | `pylon SDK not found` | Set `-DPYLON_ROOT=` to your install prefix |
 | No camera found | USB cable, `install_udev`, camera powered |
 | No valid tracks after warmup | Lighting, gain (target ~80–100 DN background), arena contrast |

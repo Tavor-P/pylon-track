@@ -60,8 +60,7 @@ endif()
 if(NOT OpenCV_FOUND)
 	message(FATAL_ERROR
 		"OpenCV not found (need components: core, imgproc, video).\n"
-		"  Ubuntu/Debian:  sudo apt update && sudo apt install -y libopencv-dev\n"
-		"  Fedora:         sudo dnf install opencv-devel\n"
+		"  Ubuntu/Debian:  sudo apt update && sudo apt install -y libopencv-dev build-essential cmake\n"
 		"  Then reconfigure, or set OpenCV_DIR explicitly, e.g.:\n"
 		"    cmake -DOpenCV_DIR=/usr/lib/x86_64-linux-gnu/cmake/opencv4 ..")
 endif()
