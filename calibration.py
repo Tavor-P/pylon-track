@@ -247,12 +247,28 @@ def draw_coverage_hud(disp, width: int, height: int, saved_cov: dict, live_cov: 
 
 
 def normalize_view_points(obj_pts, img_pts) -> tuple[np.ndarray, np.ndarray]:
-	"""OpenCV calibrators need (N,3) and (N,2); matchImagePoints shape varies by version."""
-	obj = np.asarray(obj_pts, dtype=np.float64).reshape(-1, 3)
-	img = np.asarray(img_pts, dtype=np.float64).reshape(-1, 2)
+	"""OpenCV Point3f/Point2f expect float32 (N,3) and (N,2), C-contiguous."""
+	obj = np.ascontiguousarray(obj_pts, dtype=np.float32).reshape(-1, 3)
+	img = np.ascontiguousarray(img_pts, dtype=np.float32).reshape(-1, 2)
 	if obj.shape[0] != img.shape[0]:
 		raise ValueError("object/image point count mismatch")
+	if not np.isfinite(obj).all() or not np.isfinite(img).all():
+		raise ValueError("non-finite calibration point")
 	return obj, img
+
+
+def build_standard_views(objpoints, imgpoints):
+	obj_out, img_out = [], []
+	for op, ip in zip(objpoints, imgpoints):
+		try:
+			o, p = normalize_view_points(op, ip)
+		except ValueError:
+			continue
+		if len(o) < MIN_POINTS_PER_VIEW:
+			continue
+		obj_out.append(o)
+		img_out.append(p)
+	return obj_out, img_out
 
 
 def load_frame_sets():
@@ -346,9 +362,11 @@ def rebalance_for_edges(objpoints, imgpoints, img_size):
 			out_img.append(ip)
 
 	if len(out_obj) < 5:
-		raise SystemExit(
-			f"only {len(out_obj)} usable views after filtering — need >=5 spread-out frames"
+		print(
+			f"warning: rebalance left {len(out_obj)} views — using all "
+			f"{len(objpoints)} raw views for calibration"
 		)
+		return objpoints, imgpoints
 
 	print(
 		f"rebalanced {len(objpoints)} -> {len(out_obj)} views "
@@ -384,19 +402,33 @@ def edge_band_rms(objpoints, imgpoints, k_mat, dist, img_size, model_id: int) ->
 
 
 def calibrate_standard(objpoints, imgpoints, img_size, rational: bool):
-	obj, img = [], []
-	for op, ip in zip(objpoints, imgpoints):
-		o, p = normalize_view_points(op, ip)
-		if len(o) < MIN_POINTS_PER_VIEW:
-			continue
-		obj.append(o)
-		img.append(p)
+	obj, img = build_standard_views(objpoints, imgpoints)
 	if len(obj) < 5:
 		raise cv2.error(f"standard calibrate needs >=5 views, got {len(obj)}")
 	flags = cv2.CALIB_RATIONAL_MODEL if rational else 0
-	rms, k_mat, dist, _, _ = cv2.calibrateCamera(
-		obj, img, img_size, None, None, flags=flags)
-	return rms, k_mat, dist, MODEL_STANDARD
+	# OpenCV Python bindings accept either (N,3) or (N,1,3) Point3f layouts.
+	layouts = (
+		("Nx3", lambda o, p: (o, p)),
+		("Nx1x3", lambda o, p: (o.reshape(-1, 1, 3), p.reshape(-1, 1, 2))),
+	)
+	last_err = None
+	for label, layout in layouts:
+		try:
+			o_cv = [np.ascontiguousarray(layout(o, p)[0]) for o, p in zip(obj, img)]
+			i_cv = [np.ascontiguousarray(layout(o, p)[1]) for o, p in zip(obj, img)]
+			rms, k_mat, dist, _, _ = cv2.calibrateCamera(
+				o_cv, i_cv, img_size, None, None, flags=flags)
+			print(f"  standard calibrate OK ({label}, {len(o_cv)} views)")
+			return rms, k_mat, dist, MODEL_STANDARD
+		except cv2.error as exc:
+			last_err = exc
+			print(f"  standard layout {label} failed: {exc}")
+	if obj:
+		print(
+			f"  debug view0: obj shape={obj[0].shape} dtype={obj[0].dtype} "
+			f"img shape={img[0].shape} dtype={img[0].dtype}"
+		)
+	raise last_err if last_err is not None else cv2.error("standard calibration failed")
 
 
 def make_initial_k(img_size: tuple[int, int]) -> np.ndarray:
@@ -417,8 +449,8 @@ def prepare_fisheye_views(objpoints, imgpoints, img_size):
 		o, p = normalize_view_points(op, ip)
 		if view_is_degenerate(p, img_size):
 			continue
-		obj.append(o.reshape(-1, 1, 3))
-		img.append(p.reshape(-1, 1, 2))
+		obj.append(o.reshape(-1, 1, 3).astype(np.float32))
+		img.append(p.reshape(-1, 1, 2).astype(np.float32))
 	if len(obj) < 5:
 		raise cv2.error(f"fisheye needs >=5 non-degenerate views, got {len(obj)}")
 	return obj, img
@@ -474,14 +506,17 @@ def pick_model(objpoints, imgpoints, img_size, model: str, rational: bool):
 		except cv2.error as exc:
 			print(f"  fisheye failed: {exc}")
 	if model in ("auto", "standard"):
-		rms, k, d, mid = calibrate_standard(fit_obj, fit_img, img_size, rational)
-		edge = edge_band_rms(objpoints, imgpoints, k, d, img_size, mid)
-		score = model_score(edge, rms)
-		candidates.append((score, rms, k, d, mid, "standard", edge))
-		print(
-			f"  standard RMS {rms:.4f}  "
-			f"L/R/C {edge['left']:.3f}/{edge['right']:.3f}/{edge['center']:.3f}"
-		)
+		try:
+			rms, k, d, mid = calibrate_standard(fit_obj, fit_img, img_size, rational)
+			edge = edge_band_rms(objpoints, imgpoints, k, d, img_size, mid)
+			score = model_score(edge, rms)
+			candidates.append((score, rms, k, d, mid, "standard", edge))
+			print(
+				f"  standard RMS {rms:.4f}  "
+				f"L/R/C {edge['left']:.3f}/{edge['right']:.3f}/{edge['center']:.3f}"
+			)
+		except cv2.error as exc:
+			print(f"  standard failed: {exc}")
 	if not candidates:
 		sys.exit(
 			"calibration failed for all models — try:\n"
@@ -598,7 +633,7 @@ def capture(camera_config: Path, exposure_scale: float, gain_offset_db: float):
 				if cids is not None and len(cids) >= MIN_POINTS_PER_VIEW:
 					_, img_pts = board.matchImagePoints(cc, cids)
 					if img_pts is not None:
-						ip = np.asarray(img_pts, dtype=np.float64).reshape(-1, 2)
+						ip = np.ascontiguousarray(img_pts, dtype=np.float32).reshape(-1, 2)
 						if frame_edge_fraction(ip, (width, height)) < 0.15:
 							print(
 								"  note: centre-heavy frame — you have enough middle; "
@@ -681,7 +716,7 @@ if __name__ == "__main__":
 	ap.add_argument("--capture", action="store_true")
 	ap.add_argument("--calibrate", action="store_true")
 	ap.add_argument("--preview", action="store_true", help="raw|undistorted grid from calib.npz")
-	ap.add_argument("--model", choices=("auto", "fisheye", "standard"), default="auto")
+	ap.add_argument("--model", choices=("auto", "fisheye", "standard"), default="standard")
 	ap.add_argument("--no-rational", action="store_true")
 	ap.add_argument("--camera-config", default="")
 	ap.add_argument("--exposure-scale", type=float, default=2.5)
