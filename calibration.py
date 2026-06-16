@@ -3,22 +3,16 @@
 Calibrate Basler a2A1920-160um + 4mm lens with a ChArUco board, then save
 intrinsics (K) and distortion coefficients for undistortion.
 
-Why ChArUco (not a plain checkerboard): your distortion is worst at the frame
-edges, so the calibration MUST see corners out there. A full checkerboard has to
-be entirely visible, so you can never push it into the extreme corners. ChArUco
-detects partial boards, so you can fill the edges/corners — which is where the
-distortion model is actually constrained.
+The 4 mm lens (~79°) is wide enough that fisheye undistort usually fits the long
+horizontal edges better than the plain rational polynomial model.
 
 Requires: opencv-contrib-python >= 4.7  (CharucoDetector API), pypylon
 
 Usage:
-  python calibration.py --make-board    # render charuco_board.png to print
-  python calibration.py --capture       # live grab; SPACE to save, q to quit
-  python calibration.py --calibrate     # compute K + dist -> calib.npz
-
-ferret_tracker loads calib.npz automatically when placed beside the binary
-(build/bin/calib.npz) or via --calib / PYLON_CAMERA_CALIB. Calibrate at the
-same width×height as camera_config.json.
+  python calibration.py --make-board
+  python calibration.py --capture
+  python calibration.py --calibrate
+  python calibration.py --preview          # raw vs undistorted grid check
 """
 
 import argparse
@@ -31,19 +25,23 @@ from pathlib import Path
 import cv2
 import numpy as np
 
-# ---- ChArUco board definition (match your printed board) --------------------
-SQUARES_X = 10          # squares across
-SQUARES_Y = 7           # squares down
-SQUARE_LEN = 0.035      # square side in metres (measure your print!)
-MARKER_LEN = 0.026      # aruco marker side in metres
+SQUARES_X = 10
+SQUARES_Y = 7
+SQUARE_LEN = 0.035
+MARKER_LEN = 0.026
 DICTIONARY = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
 IMG_DIR = "calib_frames"
 DEFAULT_CAMERA_CONFIG = "src/camera_config.json"
 
-# Fraction of frame width/height treated as the "edge band" for coverage checks.
-EDGE_MARGIN = 0.12
-# 3×3 zone grid — all zones should turn green across saved frames before calibrate.
+MODEL_STANDARD = 0
+MODEL_FISHEYE = 1
+
+# Wider bands on left/right — the 1920 px sides are where barrel distortion shows.
+EDGE_MARGIN_X = 0.18
+EDGE_MARGIN_Y = 0.12
 ZONE_GRID = 3
+# Default alpha=0 crops invalid edge pixels; straighter long edges for tracking.
+UNDISTORT_ALPHA = 0.0
 
 
 def make_board():
@@ -52,14 +50,11 @@ def make_board():
 
 
 def make_detector():
-	"""Detector tuned for wide-angle vignetting and small markers near borders."""
 	det_params = cv2.aruco.DetectorParameters()
-	# Wider adaptive threshold search helps low-contrast markers in dark edge bands.
 	det_params.adaptiveThreshWinSizeMin = 3
 	det_params.adaptiveThreshWinSizeMax = 33
 	det_params.adaptiveThreshWinSizeStep = 4
 	det_params.adaptiveThreshConstant = 5
-	# Allow smaller apparent markers when the board is tilted or near the border.
 	det_params.minMarkerPerimeterRate = 0.02
 	det_params.maxMarkerPerimeterRate = 4.0
 	det_params.minCornerDistanceRate = 0.01
@@ -91,7 +86,6 @@ def load_camera_config(path: Path) -> dict:
 
 
 def apply_camera_config(cam, cfg: dict, exposure_scale: float, gain_offset_db: float):
-	"""Mirror production AOI/exposure; optional boost brightens vignetted edges."""
 	from pypylon import pylon
 
 	if cfg.get("pixel_format", "Mono8") != "Mono8":
@@ -106,14 +100,12 @@ def apply_camera_config(cam, cfg: dict, exposure_scale: float, gain_offset_db: f
 	exposure_auto = bool(cfg.get("exposure_auto", False))
 	cam.ExposureAuto.SetValue("Continuous" if exposure_auto else "Off")
 	if not exposure_auto:
-		exposure_us = float(cfg["exposure_time_us"]) * exposure_scale
-		cam.ExposureTime.SetValue(exposure_us)
+		cam.ExposureTime.SetValue(float(cfg["exposure_time_us"]) * exposure_scale)
 
 	gain_auto = bool(cfg.get("gain_auto", False))
 	cam.GainAuto.SetValue("Continuous" if gain_auto else "Off")
 	if not gain_auto:
-		gain_db = float(cfg["gain_db"]) + gain_offset_db
-		cam.Gain.SetValue(gain_db)
+		cam.Gain.SetValue(float(cfg["gain_db"]) + gain_offset_db)
 
 	if bool(cfg.get("frame_rate_enable", True)):
 		cam.AcquisitionFrameRateEnable.SetValue(True)
@@ -126,17 +118,24 @@ def apply_camera_config(cam, cfg: dict, exposure_scale: float, gain_offset_db: f
 
 	print(
 		f"camera: {cfg['width']}x{cfg['height']} "
-		f"offset=({cfg.get('offset_x', 0)},{cfg.get('offset_y', 0)}) "
-		f"exposure_scale={exposure_scale:.2f} gain_offset={gain_offset_db:+.1f}dB"
+		f"exposure×{exposure_scale:.2f} gain+{gain_offset_db:.1f}dB"
 	)
 
 
 def detect_board(gray: np.ndarray):
-	"""Run ChArUco detection; CLAHE helps markers in dark edge bands."""
-	# CLAHE is for detection only — saved PNGs stay raw for an honest calibrate step.
-	clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-	enhanced = clahe.apply(gray)
-	return detector.detectBoard(enhanced)
+	clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
+	return detector.detectBoard(clahe.apply(gray))
+
+
+def empty_coverage() -> dict:
+	return {
+		"zones": set(),
+		"edges": {k: False for k in ("left", "right", "top", "bottom")},
+		"strips": {k: False for k in (
+			"left_top", "left_mid", "left_bot",
+			"right_top", "right_mid", "right_bot",
+		)},
+	}
 
 
 def zone_index(x: float, y: float, width: int, height: int) -> tuple[int, int]:
@@ -146,37 +145,72 @@ def zone_index(x: float, y: float, width: int, height: int) -> tuple[int, int]:
 
 
 def coverage_from_corners(corners, width: int, height: int) -> dict:
-	"""Summarise which zones and edge bands have at least one corner."""
-	zones: set[tuple[int, int]] = set()
-	edges = {"left": False, "right": False, "top": False, "bottom": False}
+	cov = empty_coverage()
 	if corners is None or len(corners) == 0:
-		return {"zones": zones, "edges": edges}
+		return cov
 
-	margin_x = width * EDGE_MARGIN
-	margin_y = height * EDGE_MARGIN
+	margin_x = width * EDGE_MARGIN_X
+	margin_y = height * EDGE_MARGIN_Y
+	third = height / 3.0
 	for pt in corners.reshape(-1, 2):
 		x, y = float(pt[0]), float(pt[1])
-		zones.add(zone_index(x, y, width, height))
+		cov["zones"].add(zone_index(x, y, width, height))
 		if x < margin_x:
-			edges["left"] = True
+			cov["edges"]["left"] = True
+			if y < third:
+				cov["strips"]["left_top"] = True
+			elif y < 2 * third:
+				cov["strips"]["left_mid"] = True
+			else:
+				cov["strips"]["left_bot"] = True
 		if x > width - margin_x:
-			edges["right"] = True
+			cov["edges"]["right"] = True
+			if y < third:
+				cov["strips"]["right_top"] = True
+			elif y < 2 * third:
+				cov["strips"]["right_mid"] = True
+			else:
+				cov["strips"]["right_bot"] = True
 		if y < margin_y:
-			edges["top"] = True
+			cov["edges"]["top"] = True
 		if y > height - margin_y:
-			edges["bottom"] = True
-	return {"zones": zones, "edges": edges}
+			cov["edges"]["bottom"] = True
+	return cov
 
 
 def merge_coverage(saved: dict, live: dict) -> dict:
 	return {
 		"zones": saved["zones"] | live["zones"],
-		"edges": {key: saved["edges"][key] or live["edges"][key] for key in saved["edges"]},
+		"edges": {k: saved["edges"][k] or live["edges"][k] for k in saved["edges"]},
+		"strips": {k: saved["strips"][k] or live["strips"][k] for k in saved["strips"]},
 	}
 
 
+def is_wide_frame(width: int, height: int) -> bool:
+	return width > height * 1.3
+
+
+def coverage_complete(cov: dict, width: int, height: int) -> bool:
+	base = (
+		len(cov["zones"]) >= ZONE_GRID * ZONE_GRID
+		and all(cov["edges"].values())
+	)
+	if not is_wide_frame(width, height):
+		return base
+	# 1920×960: require corners along the full length of left/right borders.
+	return base and all(cov["strips"].values())
+
+
+def print_coverage_report(cov: dict, width: int, height: int, prefix: str = ""):
+	edges = ", ".join(f"{k}={'yes' if v else 'NO'}" for k, v in cov["edges"].items())
+	msg = f"{prefix}zones {len(cov['zones'])}/{ZONE_GRID * ZONE_GRID}, edges: {edges}"
+	if is_wide_frame(width, height):
+		missing = [k for k, v in cov["strips"].items() if not v]
+		msg += f", long-edge strips missing: {missing if missing else 'none'}"
+	print(msg)
+
+
 def draw_coverage_hud(disp, width: int, height: int, saved_cov: dict, live_cov: dict):
-	"""Overlay 3×3 grid: green=saved, yellow=live only, red=uncovered."""
 	cell_w = width // ZONE_GRID
 	cell_h = height // ZONE_GRID
 	for row in range(ZONE_GRID):
@@ -191,49 +225,164 @@ def draw_coverage_hud(disp, width: int, height: int, saved_cov: dict, live_cov: 
 				color = (0, 0, 220)
 			cv2.rectangle(disp, (x0, y0), (x0 + cell_w, y0 + cell_h), color, 2)
 
-	margin_x = int(width * EDGE_MARGIN)
-	margin_y = int(height * EDGE_MARGIN)
-	cv2.rectangle(disp, (0, 0), (width - 1, height - 1), (255, 255, 0), 1)
-	cv2.rectangle(
-		disp, (margin_x, margin_y), (width - margin_x, height - margin_y), (180, 180, 180), 1
-	)
+	mx = int(width * EDGE_MARGIN_X)
+	my = int(height * EDGE_MARGIN_Y)
+	cv2.rectangle(disp, (0, 0), (mx, height - 1), (255, 120, 0), 2)
+	cv2.rectangle(disp, (width - mx, 0), (width - 1, height - 1), (255, 120, 0), 2)
+	cv2.rectangle(disp, (0, 0), (width - 1, my), (200, 200, 0), 1)
+	cv2.rectangle(disp, (0, height - my), (width - 1, height - 1), (200, 200, 0), 1)
 
-	edge_labels = (
-		("left", (10, height // 2)),
-		("right", (width - 70, height // 2)),
-		("top", (width // 2 - 20, 24)),
-		("bottom", (width // 2 - 30, height - 12)),
-	)
-	for name, (tx, ty) in edge_labels:
-		ok = saved_cov["edges"][name]
-		label = f"{name}:{'OK' if ok else 'need'}"
+	if is_wide_frame(width, height):
+		for y in (int(height / 3), int(2 * height / 3)):
+			cv2.line(disp, (0, y), (mx, y), (255, 120, 0), 1)
+			cv2.line(disp, (width - mx, y), (width - 1, y), (255, 120, 0), 1)
 		cv2.putText(
-			disp, label, (tx, ty), cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-			(0, 255, 0) if ok else (0, 0, 255), 2, cv2.LINE_AA,
+			disp, "LONG EDGES: fill orange L/R bands top/mid/bot",
+			(20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 120, 0), 2,
 		)
 
 
-def coverage_complete(cov: dict) -> bool:
-	want_zones = ZONE_GRID * ZONE_GRID
-	return len(cov["zones"]) >= want_zones and all(cov["edges"].values())
+def load_frame_sets():
+	files = sorted(glob.glob(f"{IMG_DIR}/*.png"))
+	if len(files) < 12:
+		sys.exit(f"only {len(files)} frames in {IMG_DIR}/ — need ~20-40")
+
+	objpoints, imgpoints, img_size = [], [], None
+	total_cov = empty_coverage()
+	for path in files:
+		img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
+		img_size = img.shape[::-1]
+		cc, cids, _, _ = detect_board(img)
+		if cids is None or len(cids) < 6:
+			print(f"  skip {os.path.basename(path)} ({0 if cids is None else len(cids)} corners)")
+			continue
+		obj_pts, img_pts = board.matchImagePoints(cc, cids)
+		if obj_pts is None or len(obj_pts) < 6:
+			continue
+		objpoints.append(np.asarray(obj_pts, dtype=np.float64))
+		imgpoints.append(np.asarray(img_pts, dtype=np.float64))
+		total_cov = merge_coverage(
+			total_cov, coverage_from_corners(cc, img_size[0], img_size[1]))
+	return objpoints, imgpoints, img_size, total_cov
 
 
-def print_coverage_report(cov: dict, prefix: str = ""):
-	edges = ", ".join(f"{k}={'yes' if v else 'NO'}" for k, v in cov["edges"].items())
-	print(
-		f"{prefix}zones {len(cov['zones'])}/{ZONE_GRID * ZONE_GRID}, edges: {edges}"
+def edge_band_rms(objpoints, imgpoints, k_mat, dist, img_size, model_id: int) -> dict:
+	"""Mean reprojection error in left/right edge bands (where long-edge distortion shows)."""
+	w, h = img_size
+	mx = w * EDGE_MARGIN_X
+	bands = {"left": [], "right": [], "center": []}
+	for obj_pts, img_pts in zip(objpoints, imgpoints):
+		if model_id == MODEL_FISHEYE:
+			proj, _ = cv2.fisheye.projectPoints(
+				obj_pts.reshape(-1, 1, 3), np.zeros(3), np.zeros(3), k_mat, dist)
+			proj = proj.reshape(-1, 2)
+		else:
+			proj, _ = cv2.projectPoints(obj_pts, np.zeros(3), np.zeros(3), k_mat, dist)
+			proj = proj.reshape(-1, 2)
+		err = np.linalg.norm(proj - img_pts.reshape(-1, 2), axis=1)
+		obs = img_pts.reshape(-1, 2)
+		for e, (x, _y) in zip(err, obs):
+			if x < mx:
+				bands["left"].append(e)
+			elif x > w - mx:
+				bands["right"].append(e)
+			else:
+				bands["center"].append(e)
+	return {k: float(np.mean(v)) if v else float("nan") for k, v in bands.items()}
+
+
+def calibrate_standard(objpoints, imgpoints, img_size, rational: bool):
+	flags = cv2.CALIB_RATIONAL_MODEL if rational else 0
+	rms, k_mat, dist, _, _ = cv2.calibrateCamera(
+		objpoints, imgpoints, img_size, None, None, flags=flags)
+	return rms, k_mat, dist, MODEL_STANDARD
+
+
+def calibrate_fisheye(objpoints, imgpoints, img_size):
+	obj = [op.reshape(-1, 1, 3).astype(np.float64) for op in objpoints]
+	img = [ip.reshape(-1, 1, 2).astype(np.float64) for ip in imgpoints]
+	k_mat = np.eye(3, dtype=np.float64)
+	dist = np.zeros((4, 1), dtype=np.float64)
+	flags = (
+		cv2.fisheye.CALIB_RECOMPUTE_EXTRINSIC
+		+ cv2.fisheye.CALIB_CHECK_COND
+		+ cv2.fisheye.CALIB_FIX_SKEW
 	)
+	criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 120, 1e-7)
+	rms, k_mat, dist, _, _ = cv2.fisheye.calibrate(
+		obj, img, img_size, k_mat, dist, None, None, flags, criteria)
+	return rms, k_mat, dist.reshape(1, 4), MODEL_FISHEYE
+
+
+def pick_model(objpoints, imgpoints, img_size, model: str, rational: bool):
+	candidates = []
+	if model in ("auto", "fisheye"):
+		try:
+			rms, k, d, mid = calibrate_fisheye(objpoints, imgpoints, img_size)
+			edge = edge_band_rms(objpoints, imgpoints, k, d, img_size, mid)
+			score = max(edge.get("left", rms), edge.get("right", rms))
+			candidates.append((score, rms, k, d, mid, "fisheye", edge))
+			print(f"  fisheye RMS {rms:.4f}  edge L/R {edge['left']:.3f}/{edge['right']:.3f}")
+		except cv2.error as exc:
+			print(f"  fisheye failed: {exc}")
+	if model in ("auto", "standard"):
+		rms, k, d, mid = calibrate_standard(objpoints, imgpoints, img_size, rational)
+		edge = edge_band_rms(objpoints, imgpoints, k, d, img_size, mid)
+		score = max(edge.get("left", rms), edge.get("right", rms))
+		candidates.append((score, rms, k, d, mid, "standard", edge))
+		print(f"  standard RMS {rms:.4f}  edge L/R {edge['left']:.3f}/{edge['right']:.3f}")
+	if not candidates:
+		sys.exit("calibration failed for all models")
+	candidates.sort(key=lambda item: item[0])
+	score, rms, k, d, mid, name, edge = candidates[0]
+	print(f"selected {name} (worst long-edge band error {score:.3f} px)")
+	return rms, k, d, mid, name, edge
+
+
+def save_calib_npz(k_mat, dist, img_size, rms, model_id, edge_err, alpha):
+	np.savez(
+		"calib.npz",
+		K=k_mat,
+		dist=dist,
+		img_size=np.array(img_size),
+		rms=np.array(rms),
+		model_id=np.array(model_id),
+		undistort_alpha=np.array(alpha),
+		edge_err_left=np.array(edge_err.get("left", np.nan)),
+		edge_err_right=np.array(edge_err.get("right", np.nan)),
+	)
+	print("saved calib.npz")
+
+
+def undistort_image(gray, k_mat, dist, model_id: int, alpha: float):
+	h, w = gray.shape
+	if model_id == MODEL_FISHEYE:
+		new_k = cv2.fisheye.estimateNewCameraMatrixForUndistortRectify(
+			k_mat, dist, (w, h), np.eye(3), balance=alpha, new_size=(w, h))
+		map1, map2 = cv2.fisheye.initUndistortRectifyMap(
+			k_mat, dist, np.eye(3), new_k, (w, h), cv2.CV_16SC2)
+	else:
+		new_k, _ = cv2.getOptimalNewCameraMatrix(k_mat, dist, (w, h), alpha, (w, h))
+		map1, map2 = cv2.initUndistortRectifyMap(
+			k_mat, dist, None, new_k, (w, h), cv2.CV_16SC2)
+	return cv2.remap(gray, map1, map2, cv2.INTER_LINEAR)
+
+
+def draw_grid(bgr, step=80):
+	h, w = bgr.shape[:2]
+	for x in range(0, w, step):
+		cv2.line(bgr, (x, 0), (x, h - 1), (0, 255, 255), 1)
+	for y in range(0, h, step):
+		cv2.line(bgr, (0, y), (w - 1, y), (0, 255, 255), 1)
 
 
 def make_board_png(path="charuco_board.png", px_per_square=240):
-	"""Render the board to print. Print FLAT on rigid backing; verify SQUARE_LEN after printing."""
 	img = board.generateImage((SQUARES_X * px_per_square, SQUARES_Y * px_per_square))
 	cv2.imwrite(path, img)
-	print(f"wrote {path} -- print it, mount flat, then MEASURE a square and update SQUARE_LEN")
+	print(f"wrote {path}")
 
 
 def capture(camera_config: Path, exposure_scale: float, gain_offset_db: float):
-	"""Grab frames from the Basler; live HUD shows edge/zone coverage."""
 	from pypylon import pylon
 
 	cfg = load_camera_config(camera_config)
@@ -249,15 +398,15 @@ def capture(camera_config: Path, exposure_scale: float, gain_offset_db: float):
 	conv.OutputPixelFormat = pylon.PixelType_Mono8
 
 	n = len(glob.glob(f"{IMG_DIR}/*.png"))
-	saved_cov = {"zones": set(), "edges": {k: False for k in ("left", "right", "top", "bottom")}}
+	saved_cov = empty_coverage()
 	width = int(cfg["width"])
 	height = int(cfg["height"])
 
 	print(
-		"SPACE = save frame, q = quit.\n"
-		"Push the board into each YELLOW corner/edge until all grid cells and edge labels are GREEN.\n"
-		"Tip: hold only a corner of the board in the frame — the full sheet does not need to fit.\n"
-		f"Using camera config: {camera_config}"
+		"SPACE=save, q=quit.\n"
+		"For 1920×960: slide the board along the ORANGE left/right bands — top, middle, "
+		"and bottom of each long edge. Only a corner of the board needs to be visible.\n"
+		f"config: {camera_config}"
 	)
 
 	while cam.IsGrabbing():
@@ -274,35 +423,28 @@ def capture(camera_config: Path, exposure_scale: float, gain_offset_db: float):
 
 		live_cov = coverage_from_corners(cc, width, height)
 		draw_coverage_hud(disp, width, height, saved_cov, live_cov)
-
-		status = "READY" if coverage_complete(saved_cov) else "cover edges"
+		ready = coverage_complete(saved_cov, width, height)
 		cv2.putText(
-			disp, f"saved:{n}  corners:{0 if cids is None else len(cids)}  {status}",
-			(20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0, 255, 0), 2,
+			disp,
+			f"saved:{n} corners:{0 if cids is None else len(cids)} {'READY' if ready else 'fill L/R strips'}",
+			(20, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0, 255, 0), 2,
 		)
-		cv2.imshow("capture", cv2.resize(disp, None, fx=0.6, fy=0.6))
+		cv2.imshow("capture", cv2.resize(disp, None, fx=0.55, fy=0.55))
 		key = cv2.waitKey(1) & 0xFF
 
 		if key == ord(" "):
 			if cids is None or len(cids) < 6:
-				print("  skip save — need >=6 detected corners in this frame")
-			elif not all(live_cov["edges"].values()):
-				missing = [name for name, ok in live_cov["edges"].items() if not ok]
-				print(
-					f"  warning: frame lacks edge corners ({', '.join(missing)}) — "
-					"saved anyway; rounded undistort corners mean weak edge data"
-				)
-				cv2.imwrite(f"{IMG_DIR}/frame_{n:03d}.png", img)
-				n += 1
-				saved_cov = merge_coverage(saved_cov, live_cov)
-				print(f"saved frame_{n - 1:03d}.png")
-				print_coverage_report(saved_cov, "  coverage: ")
+				print("  skip — need >=6 corners")
 			else:
+				if is_wide_frame(width, height):
+					missing = [k for k, v in live_cov["strips"].items() if not v]
+					if missing:
+						print(f"  warning: missing long-edge strips {missing}")
 				cv2.imwrite(f"{IMG_DIR}/frame_{n:03d}.png", img)
 				n += 1
 				saved_cov = merge_coverage(saved_cov, live_cov)
 				print(f"saved frame_{n - 1:03d}.png")
-				print_coverage_report(saved_cov, "  coverage: ")
+				print_coverage_report(saved_cov, width, height, "  ")
 		elif key == ord("q"):
 			res.Release()
 			break
@@ -312,56 +454,53 @@ def capture(camera_config: Path, exposure_scale: float, gain_offset_db: float):
 	cam.Close()
 	cv2.destroyAllWindows()
 	print(f"{n} frames in {IMG_DIR}/")
-	print_coverage_report(saved_cov, "final coverage: ")
-	if not coverage_complete(saved_cov):
-		print(
-			"WARNING: edge/zone coverage incomplete — undistortion will look fine in the "
-			"centre but rounded/warped near corners. Re-run --capture and fill red zones."
-		)
+	print_coverage_report(saved_cov, width, height, "final: ")
+	if not coverage_complete(saved_cov, width, height):
+		print("WARNING: long-edge coverage incomplete — expect curved borders after undistort.")
 
 
-def calibrate(use_rational_model=True):
-	"""Compute K + distortion from saved frames; save to calib.npz."""
-	files = sorted(glob.glob(f"{IMG_DIR}/*.png"))
-	if len(files) < 12:
-		sys.exit(f"only {len(files)} frames -- grab ~20-40 covering the whole frame")
+def calibrate(model: str, rational: bool, alpha: float):
+	objpoints, imgpoints, img_size, total_cov = load_frame_sets()
+	w, h = img_size
+	print(f"using {len(objpoints)} frames on {w}x{h}")
+	print_coverage_report(total_cov, w, h, "dataset: ")
+	if not coverage_complete(total_cov, w, h):
+		print("WARNING: dataset missing long-edge strips — fisheye fit will extrapolate at borders.")
 
-	objpoints, imgpoints, img_size = [], [], None
-	total_cov = {"zones": set(), "edges": {k: False for k in ("left", "right", "top", "bottom")}}
-
-	for path in files:
-		img = cv2.imread(path, cv2.IMREAD_GRAYSCALE)
-		img_size = img.shape[::-1]  # (w, h)
-		cc, cids, _, _ = detect_board(img)
-		if cids is None or len(cids) < 6:
-			print(f"  skip {os.path.basename(path)} (only {0 if cids is None else len(cids)} corners)")
-			continue
-		obj_pts, img_pts = board.matchImagePoints(cc, cids)
-		if obj_pts is None or len(obj_pts) < 6:
-			continue
-		objpoints.append(obj_pts)
-		imgpoints.append(img_pts)
-		frame_cov = coverage_from_corners(cc, img_size[0], img_size[1])
-		total_cov = merge_coverage(total_cov, frame_cov)
-
-	print(f"using {len(objpoints)} usable frames")
-	print_coverage_report(total_cov, "dataset coverage: ")
-	if not coverage_complete(total_cov):
-		print(
-			"WARNING: saved frames do not cover all edge bands / zones — expect rounded "
-			"corners after undistort. Re-capture with the on-screen coverage HUD green."
-		)
-
-	flags = cv2.CALIB_RATIONAL_MODEL if use_rational_model else 0
-	rms, k_mat, dist, _rvecs, _tvecs = cv2.calibrateCamera(
-		objpoints, imgpoints, img_size, None, None, flags=flags
-	)
-
-	print(f"\nRMS reprojection error: {rms:.4f} px   (aim for < ~0.3; >0.6 => recapture)")
+	rms, k_mat, dist, model_id, model_name, edge_err = pick_model(
+		objpoints, imgpoints, img_size, model, rational)
+	print(f"\nRMS {rms:.4f} px  model={model_name}  alpha={alpha}")
+	print(f"long-edge error L={edge_err['left']:.3f} R={edge_err['right']:.3f} px")
 	print("K =\n", k_mat)
 	print("dist =", dist.ravel())
-	np.savez("calib.npz", K=k_mat, dist=dist, img_size=img_size, rms=rms)
-	print("\nsaved calib.npz")
+	save_calib_npz(k_mat, dist, img_size, rms, model_id, edge_err, alpha)
+	preview_undistort(img_size, k_mat, dist, model_id, alpha)
+
+
+def preview_undistort(img_size, k_mat=None, dist=None, model_id=None, alpha=None):
+	if k_mat is None:
+		data = np.load("calib.npz")
+		k_mat, dist = data["K"], data["dist"]
+		img_size = tuple(int(x) for x in data["img_size"])
+		model_id = int(data.get("model_id", MODEL_STANDARD))
+		alpha = float(data.get("undistort_alpha", UNDISTORT_ALPHA))
+
+	files = sorted(glob.glob(f"{IMG_DIR}/*.png"))
+	if not files:
+		sys.exit(f"no frames in {IMG_DIR}/ for preview")
+	img = cv2.imread(files[len(files) // 2], cv2.IMREAD_GRAYSCALE)
+	und = undistort_image(img, k_mat, dist, model_id, alpha)
+	raw_bgr = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+	und_bgr = cv2.cvtColor(und, cv2.COLOR_GRAY2BGR)
+	draw_grid(raw_bgr)
+	draw_grid(und_bgr)
+	combo = np.hstack([raw_bgr, und_bgr])
+	cv2.putText(combo, "raw", (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+	cv2.putText(combo, "undistorted", (img_size[0] + 20, 40),
+		cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 255, 0), 2)
+	out = "undistort_preview.png"
+	cv2.imwrite(out, combo)
+	print(f"wrote {out} — yellow grid lines should be straight, especially on long edges")
 
 
 if __name__ == "__main__":
@@ -369,16 +508,13 @@ if __name__ == "__main__":
 	ap.add_argument("--make-board", action="store_true")
 	ap.add_argument("--capture", action="store_true")
 	ap.add_argument("--calibrate", action="store_true")
-	ap.add_argument("--no-rational", action="store_true", help="use plain 5-coeff model")
-	ap.add_argument("--camera-config", default="", help="AOI/exposure JSON (default: src/camera_config.json)")
-	ap.add_argument(
-		"--exposure-scale", type=float, default=2.0,
-		help="multiply exposure_time_us during capture to brighten vignetted edges (default 2.0)",
-	)
-	ap.add_argument(
-		"--gain-offset-db", type=float, default=3.0,
-		help="add gain (dB) during capture for edge marker visibility (default +3)",
-	)
+	ap.add_argument("--preview", action="store_true", help="raw|undistorted grid from calib.npz")
+	ap.add_argument("--model", choices=("auto", "fisheye", "standard"), default="auto")
+	ap.add_argument("--no-rational", action="store_true")
+	ap.add_argument("--camera-config", default="")
+	ap.add_argument("--exposure-scale", type=float, default=2.5)
+	ap.add_argument("--gain-offset-db", type=float, default=4.0)
+	ap.add_argument("--undistort-alpha", type=float, default=UNDISTORT_ALPHA)
 	args = ap.parse_args()
 	config_path = resolve_camera_config(args.camera_config)
 
@@ -387,6 +523,8 @@ if __name__ == "__main__":
 	elif args.capture:
 		capture(config_path, args.exposure_scale, args.gain_offset_db)
 	elif args.calibrate:
-		calibrate(use_rational_model=not args.no_rational)
+		calibrate(args.model, not args.no_rational, args.undistort_alpha)
+	elif args.preview:
+		preview_undistort(None)
 	else:
 		ap.print_help()

@@ -29,7 +29,6 @@ std::string exe_directory(const char* argv0) {
 	return exe.parent_path().string();
 }
 
-// calibration.py stores float64 arrays from cv2.calibrateCamera.
 cv::Mat npy_to_mat64(const cnpy::NpyArray& arr) {
 	if (arr.word_size != sizeof(double)) {
 		throw std::runtime_error("expected float64 numpy array");
@@ -70,7 +69,7 @@ cv::Size read_img_size(const cnpy::NpyArray& arr) {
 
 double read_scalar_double(const cnpy::NpyArray& arr) {
 	if (arr.num_vals != 1) {
-		throw std::runtime_error("rms must be a scalar");
+		throw std::runtime_error("expected scalar array");
 	}
 	if (arr.word_size == sizeof(double)) {
 		return arr.data<double>()[0];
@@ -78,16 +77,40 @@ double read_scalar_double(const cnpy::NpyArray& arr) {
 	if (arr.word_size == sizeof(float)) {
 		return static_cast<double>(arr.data<float>()[0]);
 	}
-	throw std::runtime_error("unsupported rms dtype");
+	if (arr.word_size == sizeof(int64_t)) {
+		return static_cast<double>(arr.data<int64_t>()[0]);
+	}
+	if (arr.word_size == sizeof(int32_t)) {
+		return static_cast<double>(arr.data<int32_t>()[0]);
+	}
+	throw std::runtime_error("unsupported scalar dtype");
 }
 
-void build_undistort_maps(CameraCalib& calib, cv::Size frame_size) {
-	// alpha=1 retains all source pixels (black margins OK); matches calibration.py preview.
+void build_standard_maps(CameraCalib& calib, cv::Size frame_size) {
 	const cv::Mat new_k = cv::getOptimalNewCameraMatrix(
-		calib.camera_matrix, calib.dist_coeffs, frame_size, 1.0, frame_size);
+		calib.camera_matrix, calib.dist_coeffs, frame_size,
+		calib.undistort_alpha, frame_size);
 	cv::initUndistortRectifyMap(
 		calib.camera_matrix, calib.dist_coeffs, cv::Mat(), new_k,
 		frame_size, CV_16SC2, calib.map1, calib.map2);
+}
+
+void build_fisheye_maps(CameraCalib& calib, cv::Size frame_size) {
+	cv::Mat new_k;
+	cv::fisheye::estimateNewCameraMatrixForUndistortRectify(
+		calib.camera_matrix, calib.dist_coeffs, frame_size,
+		cv::Matx33d::eye(), new_k, calib.undistort_alpha, frame_size, 1.0);
+	cv::fisheye::initUndistortRectifyMap(
+		calib.camera_matrix, calib.dist_coeffs, cv::Matx33d::eye(), new_k,
+		frame_size, CV_16SC2, calib.map1, calib.map2);
+}
+
+void build_undistort_maps(CameraCalib& calib, cv::Size frame_size) {
+	if (calib.model == CalibModel::Fisheye) {
+		build_fisheye_maps(calib, frame_size);
+	} else {
+		build_standard_maps(calib, frame_size);
+	}
 	calib.image_size = frame_size;
 }
 
@@ -122,13 +145,20 @@ std::optional<CameraCalib> load_camera_calib(const std::string& path,
 		}
 
 		CameraCalib calib;
+		if (npz.find("model_id") != npz.end()) {
+			const int model = static_cast<int>(read_scalar_double(npz.at("model_id")));
+			calib.model = model == 1 ? CalibModel::Fisheye : CalibModel::Standard;
+		}
+		if (npz.find("undistort_alpha") != npz.end()) {
+			calib.undistort_alpha = read_scalar_double(npz.at("undistort_alpha"));
+		}
+
 		calib.camera_matrix = npy_to_mat64(npz.at("K"));
 		calib.dist_coeffs = npy_to_mat64(npz.at("dist"));
 		if (calib.camera_matrix.rows != 3 || calib.camera_matrix.cols != 3) {
 			log_error("calib", "K must be 3×3");
 			return std::nullopt;
 		}
-		// OpenCV accepts 1×N or N×1 distortion vectors.
 		if (calib.dist_coeffs.rows != 1 && calib.dist_coeffs.cols != 1) {
 			log_error("calib", "dist must be a vector");
 			return std::nullopt;
@@ -154,9 +184,11 @@ std::optional<CameraCalib> load_camera_calib(const std::string& path,
 
 		build_undistort_maps(calib, frame_size);
 
+		const char* model_name = calib.model == CalibModel::Fisheye ? "fisheye" : "standard";
 		std::ostringstream oss;
-		oss << "Loaded " << path << " (rms=" << calib.rms
-			<< " px, " << frame_size.width << "x" << frame_size.height << ")";
+		oss << "Loaded " << path << " (" << model_name << ", rms=" << calib.rms
+			<< " px, alpha=" << calib.undistort_alpha << ", "
+			<< frame_size.width << "x" << frame_size.height << ")";
 		log_info("calib", oss.str());
 		return calib;
 	} catch (const std::exception& e) {
