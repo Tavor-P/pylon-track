@@ -9,7 +9,7 @@ struct CameraSettings {
 	int offset_x = 0;
 	int offset_y = 120;
 	bool exposure_auto = false;
-	double exposure_time_us = 2000.0;
+	double exposure_time_us = 5000.0;
 	// Standard (19 µs–10 s) or UltraShort (1–14 µs); JSON alias "Common" ok.
 	std::string exposure_time_mode = "Standard";
 	bool gain_auto = false;
